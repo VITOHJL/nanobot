@@ -4,10 +4,12 @@ import os
 import secrets
 import string
 from typing import Any
+import json
 
 import json_repair
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
@@ -169,6 +171,35 @@ class LiteLLMProvider(LLMProvider):
             sanitized.append(clean)
         return sanitized
 
+    def _debug_log_prompt(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> None:
+        """Log the prompt and tools for debugging (when logging is enabled)."""
+        try:
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+            }
+            if tools:
+                payload["tools"] = tools
+            logger.debug(
+                "LLM request payload:\n{}",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except Exception as e:
+            logger.debug("Failed to log LLM request payload: {}", e)
+
+    def _debug_log_response(self, response: Any) -> None:
+        """Log raw LLM response for debugging (when logging is enabled)."""
+        try:
+            # Some providers return pydantic models / custom objects; json.dumps may fail.
+            logger.debug("LLM raw response: {}", response)
+        except Exception:
+            logger.debug("LLM raw response (repr): {}", repr(response))
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -231,8 +262,13 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
+        # Debug logging for prompts (uses sanitized messages/tools actually sent to the provider)
+        self._debug_log_prompt(model, kwargs["messages"], kwargs.get("tools"))
+
         try:
             response = await acompletion(**kwargs)
+            # Debug logging for raw provider response
+            self._debug_log_response(response)
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
