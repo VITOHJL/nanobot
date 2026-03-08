@@ -101,6 +101,23 @@ class LLMProvider(ABC):
             sanitized.append(clean)
         return sanitized
 
+    def estimate_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ) -> tuple[int, str]:
+        """
+        Estimate prompt tokens for a request.
+
+        Returns:
+            (tokens, source), where source is one of:
+            - "provider_counter"
+            - "tiktoken"
+            - "none"
+        """
+        return 0, "none"
+
     @abstractmethod
     async def chat(
         self,

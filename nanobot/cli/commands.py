@@ -328,9 +328,12 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
+        max_tokens=config.agents.defaults.max_tokens_output,
+        max_tokens_input=config.agents.defaults.max_tokens_input,
+        compression_start_ratio=config.agents.defaults.compression_start_ratio,
+        compression_target_ratio=config.agents.defaults.compression_target_ratio,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
@@ -513,9 +516,12 @@ def agent(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
+        max_tokens=config.agents.defaults.max_tokens_output,
+        max_tokens_input=config.agents.defaults.max_tokens_input,
+        compression_start_ratio=config.agents.defaults.compression_start_ratio,
+        compression_target_ratio=config.agents.defaults.compression_target_ratio,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
+        
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
@@ -548,6 +554,7 @@ def agent(
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             _print_agent_response(response, render_markdown=markdown)
+            await agent_loop.wait_for_background_compression()
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())

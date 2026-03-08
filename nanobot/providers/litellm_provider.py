@@ -6,11 +6,18 @@ import secrets
 import string
 from typing import Any
 import json
+from datetime import datetime
+from pathlib import Path
 
 import json_repair
 import litellm
 from litellm import acompletion
 from loguru import logger
+
+try:
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
@@ -207,34 +214,242 @@ class LiteLLMProvider(LLMProvider):
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
         return sanitized
 
+    @staticmethod
+    def _classify_call_type(
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Classify call type for separate debug logs."""
+        for msg in messages:
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                lowered = content.lower()
+                if "memory consolidation agent" in lowered:
+                    return "memory"
+                if "# subagent" in lowered or "subagent spawned" in lowered:
+                    return "subagent"
+                if "[cron job]" in lowered:
+                    return "cron"
+        if metadata and (metadata.get("cron_job_id") or metadata.get("cron")):
+            return "cron"
+        return "normal"
+
     def _debug_log_prompt(
         self,
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Log the prompt and tools for debugging (when logging is enabled)."""
+        """Persist latest prompt in a readable text format."""
         try:
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-            }
-            if tools:
-                payload["tools"] = tools
-            logger.debug(
-                "LLM request payload:\n{}",
-                json.dumps(payload, ensure_ascii=False, indent=2),
-            )
-        except Exception as e:
-            logger.debug("Failed to log LLM request payload: {}", e)
+            base = Path.home() / ".nanobot" / "debug"
+            base.mkdir(parents=True, exist_ok=True)
+            call_type = self._classify_call_type(messages, metadata)
+            path = base / ("prompts.log" if call_type == "normal" else f"prompts.{call_type}.log")
 
-    def _debug_log_response(self, response: Any) -> None:
-        """Log raw LLM response for debugging (when logging is enabled)."""
-        try:
-            # Some providers return pydantic models / custom objects; json.dumps may fail.
-            logger.debug("LLM raw response: {}", response)
+            ts = datetime.now().isoformat()
+            sep = "=" * 80
+            lines: list[str] = [f"{sep}\n", f"{ts}  model={model}\n\n", "=== MESSAGES ===\n\n"]
+
+            for idx, msg in enumerate(messages, start=1):
+                role = msg.get("role", "?")
+                content = msg.get("content")
+                tool_calls = msg.get("tool_calls")
+                tc_hint = ""
+                if isinstance(tool_calls, list):
+                    names = [
+                        tc.get("function", {}).get("name", "")
+                        for tc in tool_calls
+                        if isinstance(tc, dict)
+                    ]
+                    names = [n for n in names if n]
+                    if names:
+                        tc_hint = f" (tool_calls: {', '.join(names)})"
+                lines.append(f"[{idx}] {role}{tc_hint}:\n")
+                if isinstance(content, str):
+                    for line in content.splitlines():
+                        lines.append(f"    {line}\n")
+                else:
+                    pretty = json.dumps(content, ensure_ascii=False, indent=2, default=str)
+                    for line in pretty.splitlines():
+                        lines.append(f"    {line}\n")
+                lines.append("\n")
+
+            lines.append("=== TOOLS (definitions) ===\n")
+            for t in tools or []:
+                fn = t.get("function", {}) if isinstance(t, dict) else {}
+                name = fn.get("name", "")
+                desc = fn.get("description", "")
+                lines.append(f"- {name}: {desc}\n")
+            lines.append("\n")
+
+            path.write_text("".join(lines), encoding="utf-8")
         except Exception:
-            logger.debug("LLM raw response (repr): {}", repr(response))
+            return
+
+    def _debug_log_response(
+        self,
+        response: Any,
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist latest response and token stats in readable text format."""
+        try:
+            base = Path.home() / ".nanobot" / "debug"
+            base.mkdir(parents=True, exist_ok=True)
+            call_type = self._classify_call_type(messages or [], metadata) if messages else "normal"
+            path = base / ("responses.log" if call_type == "normal" else f"responses.{call_type}.log")
+
+            usage_block = ""
+            usage_available = False
+            usage = getattr(response, "usage", None)
+            if usage:
+                pt = getattr(usage, "prompt_tokens", None)
+                ct = getattr(usage, "completion_tokens", None)
+                tt = getattr(usage, "total_tokens", None)
+                if pt is not None or tt is not None:
+                    usage_available = True
+                usage_block = (
+                    "=== PROVIDER USAGE ===\n"
+                    f"- prompt_tokens    : {pt}\n"
+                    f"- completion_tokens: {ct}\n"
+                    f"- total_tokens     : {tt}\n\n"
+                )
+
+            estimated_block = ""
+            if not usage_available and messages is not None:
+                prompt_tokens, prompt_source = self.estimate_prompt_tokens(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                )
+                completion_tokens = 0
+                try:
+                    choice = getattr(response, "choices", [None])[0] if hasattr(response, "choices") else None
+                    if choice:
+                        message = getattr(choice, "message", None)
+                        if message:
+                            content = getattr(message, "content", None)
+                            if content:
+                                completion_tokens = self._estimate_completion_tokens(content)
+                except Exception:
+                    completion_tokens = 0
+                estimated_block = (
+                    "=== ESTIMATED TOKENS (nanobot, fallback) ===\n"
+                    f"- prompt_source             : {prompt_source}\n"
+                    f"- estimated_prompt_tokens    : {prompt_tokens}\n"
+                    f"- estimated_completion_tokens: {completion_tokens}\n"
+                    f"- estimated_total_tokens     : {prompt_tokens + completion_tokens}\n\n"
+                )
+
+            try:
+                if hasattr(response, "model_dump"):
+                    raw = response.model_dump()
+                elif hasattr(response, "dict"):
+                    raw = response.dict()
+                else:
+                    raw = response
+            except Exception:
+                raw = str(response)
+
+            body = json.dumps(raw, ensure_ascii=False, indent=2, default=str)
+            ts = datetime.now().isoformat()
+            sep = "=" * 80
+            lines = [
+                f"{sep}\n",
+                f"{ts}\n\n",
+                estimated_block,
+                usage_block,
+                "=== RAW RESPONSE ===\n\n",
+                body,
+                "\n",
+            ]
+            path.write_text("".join(lines), encoding="utf-8")
+        except Exception:
+            return
+
+    @staticmethod
+    def _estimate_prompt_tokens(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Estimate prompt tokens with tiktoken only."""
+        if tiktoken is None:
+            return 0
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            parts: list[str] = []
+            for msg in messages:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            txt = part.get("text", "")
+                            if txt:
+                                parts.append(txt)
+            if tools is not None:
+                parts.append(json.dumps(tools, ensure_ascii=False))
+            return len(enc.encode("\n".join(parts)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _estimate_completion_tokens(content: str) -> int:
+        """Estimate completion tokens with tiktoken only."""
+        if tiktoken is None:
+            return 0
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(content))
+        except Exception:
+            return 0
+
+    def estimate_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ) -> tuple[int, str]:
+        """
+        Unified prompt token estimation:
+        provider token counter -> tiktoken -> none.
+        """
+        original_model = model or self.default_model
+        resolved_model = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, resolved_model)
+        sanitized_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages),
+            extra_keys=extra_msg_keys,
+        )
+        effective_tools = tools
+        if self._supports_cache_control(original_model):
+            sanitized_messages, effective_tools = self._apply_cache_control(
+                sanitized_messages, effective_tools
+            )
+
+        try:
+            counted = litellm.token_counter(
+                model=resolved_model,
+                messages=sanitized_messages,
+                tools=effective_tools,
+            )
+            if isinstance(counted, (int, float)) and counted > 0:
+                return int(counted), "provider_counter"
+        except Exception:
+            pass
+
+        estimated = self._estimate_prompt_tokens(sanitized_messages, effective_tools)
+        if estimated > 0:
+            return int(estimated), "tiktoken"
+        return 0, "none"
 
     async def chat(
         self,
@@ -304,8 +519,13 @@ class LiteLLMProvider(LLMProvider):
 
         try:
             response = await acompletion(**kwargs)
-            # Debug logging for raw provider response
-            self._debug_log_response(response)
+            # Debug logging for raw provider response and token stats
+            self._debug_log_response(
+                response,
+                messages=kwargs["messages"],
+                tools=kwargs.get("tools"),
+                model=model,
+            )
             return self._parse_response(response)
         except Exception as e:
             # Return error as content for graceful handling
